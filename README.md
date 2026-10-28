@@ -106,6 +106,25 @@ updownio-pulse --pulse xxxx/YYYYYYYY --always --payload='exit-code={{.ExitCode}}
 
 Then set the check's "contains" field to `exit-code=0`: any other exit code marks the check DOWN.
 
+### Timeouts and overlapping runs
+
+> [!TIP]
+> `updownio-pulse` does one thing only, and composes well with standard tools.
+>
+> Kill a job that hangs with `timeout`: it exits with 124, so the pulse is skipped (or, with `--always` and the [payload above](#report-failures-through-the-pulse-body), reports `exit-code=124`).
+>
+> ```sh
+> updownio-pulse --pulse xxxx/YYYYYYYY -- timeout 1h ./backup.sh
+> ```
+>
+> Skip a run while the previous one is still going with `flock`: no pulse is sent, so updown.io alerts you if it keeps happening.
+>
+> ```sh
+> flock -n /var/lock/backup.lock updownio-pulse --pulse xxxx/YYYYYYYY -- ./backup.sh
+> ```
+>
+> Both come with coreutils/util-linux on Debian and Ubuntu, and with busybox on Alpine, but not with `scratch` or distroless images.
+
 ## Security
 
 Treat your pulse URL like a password: anyone who knows it can send pulses and hide real failures.
