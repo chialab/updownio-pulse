@@ -1,13 +1,16 @@
 package main
 
 import (
+	"cmp"
 	"errors"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"runtime"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -135,8 +138,19 @@ func TestSendRetries(t *testing.T) {
 	}
 }
 
-func TestRun(t *testing.T) {
-	t.Parallel()
+type runCase struct {
+	name     string
+	env      map[string]string // on top of UPDOWN_PULSE pointing to the test server
+	status   int               // pulse response, 200 if zero
+	args     []string          // "$PULSE" is replaced with the test server's pulse URL
+	wantCode int
+	wantHits int32
+	wantLast string
+}
+
+// testRun runs each case against a local pulse server.
+func testRun(t *testing.T, cases []runCase) {
+	t.Helper()
 
 	// Git Bash provides sh on Windows, but without POSIX signal semantics.
 	_, err := exec.LookPath("sh")
@@ -144,35 +158,22 @@ func TestRun(t *testing.T) {
 		t.Skip("needs a POSIX sh")
 	}
 
-	cases := []struct {
-		name     string
-		args     []string
-		wantCode int
-		wantHits int32
-		wantLast string
-	}{
-		{"success sends GET", []string{"--", "sh", "-c", "exit 0"}, 0, 1, "GET "},
-		{"failure skips pulse", []string{"--", "sh", "-c", "exit 42"}, 42, 0, ""},
-		{
-			"always with payload",
-			[]string{"--always", "--payload=exit-code={{.ExitCode}}", "--", "sh", "-c", "exit 42"},
-			42, 1, "POST exit-code=42",
-		},
-		{
-			"signaled",
-			[]string{"--always", "--payload={{.ExitCode}}", "--", "sh", "-c", "kill -TERM $$"},
-			143, 1, "POST 143",
-		},
-		{"not found", []string{"--always", "--", "./does-not-exist"}, 127, 1, "GET "},
-		{"usage error", []string{"--timeout=0", "--", "sh", "-c", "exit 0"}, 2, 0, ""},
-	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			srv, hits, last := server(t, 200)
+			srv, hits, last := server(t, cmp.Or(tc.status, http.StatusOK))
 
-			code := run(append([]string{"--pulse", srv.URL + "/x/y"}, tc.args...))
+			pulse := srv.URL + "/x/y"
+			env := map[string]string{"UPDOWN_PULSE": pulse}
+			maps.Copy(env, tc.env)
+
+			args := make([]string, len(tc.args))
+			for i, arg := range tc.args {
+				args[i] = strings.ReplaceAll(arg, "$PULSE", pulse)
+			}
+
+			code := run(args, func(k string) string { return env[k] })
 			if code != tc.wantCode || hits.Load() != tc.wantHits || *last != tc.wantLast {
 				t.Errorf(
 					"code=%d hits=%d last=%q; want %d %d %q",
@@ -181,4 +182,101 @@ func TestRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRun(t *testing.T) {
+	t.Parallel()
+
+	testRun(t, []runCase{
+		{"success sends GET", nil, 0, []string{"--", "sh", "-c", "exit 0"}, 0, 1, "GET "},
+		{"failure skips pulse", nil, 0, []string{"--", "sh", "-c", "exit 42"}, 42, 0, ""},
+		{
+			"always with payload", nil, 0,
+			[]string{"--always", "--payload=exit-code={{.ExitCode}}", "--", "sh", "-c", "exit 42"},
+			42, 1, "POST exit-code=42",
+		},
+		{
+			"short flags", nil, 0,
+			[]string{"-a", "-d", "{{.ExitCode}}", "--", "sh", "-c", "exit 3"},
+			3, 1, "POST 3",
+		},
+		{
+			"signaled", nil, 0,
+			[]string{"--always", "--payload={{.ExitCode}}", "--", "sh", "-c", "kill -TERM $$"},
+			143, 1, "POST 143",
+		},
+		{"not found", nil, 0, []string{"--always", "--", "./does-not-exist"}, 127, 1, "GET "},
+		{"usage error", nil, 0, []string{"--timeout=0", "--", "sh", "-c", "exit 0"}, 2, 0, ""},
+	})
+}
+
+func TestRunEnv(t *testing.T) {
+	t.Parallel()
+
+	testRun(t, []runCase{
+		{
+			"flag overrides invalid env",
+			map[string]string{"UPDOWN_PULSE_TIMEOUT": "abc", "UPDOWN_PULSE_RETRIES": "abc"},
+			0,
+			[]string{"-t", "5", "--retry=1", "--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
+			"pulse flag overrides env",
+			map[string]string{"UPDOWN_PULSE": "ftp://invalid/x"},
+			0,
+			[]string{"--pulse", "$PULSE", "--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
+			"missing pulse",
+			map[string]string{"UPDOWN_PULSE": ""},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			2, 0, "",
+		},
+		{
+			"invalid env",
+			map[string]string{"UPDOWN_PULSE_RETRIES": "abc"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			2, 0, "",
+		},
+		{
+			"env validated",
+			map[string]string{"UPDOWN_PULSE_TIMEOUT": "0"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			2, 0, "",
+		},
+		{
+			"flag overrides env",
+			map[string]string{"UPDOWN_PULSE_TIMEOUT": "0"},
+			0,
+			[]string{"-t", "5", "--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+	})
+}
+
+func TestRunPulseError(t *testing.T) {
+	t.Parallel()
+
+	testRun(t, []runCase{
+		{
+			"pulse error ignored", nil, http.StatusNotFound,
+			[]string{"--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
+			"fail on pulse error", nil, http.StatusNotFound,
+			[]string{"--fail-on-pulse-error", "--", "sh", "-c", "exit 0"},
+			75, 1, "GET ",
+		},
+		{
+			"command code wins over pulse error", nil, http.StatusNotFound,
+			[]string{"-f", "-a", "--", "sh", "-c", "exit 3"},
+			3, 1, "GET ",
+		},
+	})
 }

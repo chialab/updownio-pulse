@@ -31,6 +31,7 @@ const (
 	maxBackoffExp  = 5  // caps the wait between retries at 32s
 
 	exitUsage      = 2
+	exitTempFail   = 75 // EX_TEMPFAIL from sysexits.h
 	exitCannotExec = 126
 	exitNotFound   = 127
 	exitSignalBase = 128 // shell convention: 128 + signal number
@@ -41,7 +42,8 @@ const (
 var version = "dev"
 
 var (
-	errMissingPulse   = errors.New("--pulse is required")
+	errMissingPulse   = errors.New("--pulse or UPDOWN_PULSE is required")
+	errInvalidEnv     = errors.New("invalid")
 	errInvalidPulse   = errors.New("invalid --pulse")
 	errInvalidRetry   = errors.New("--retry must be >= 0")
 	errInvalidTimeout = errors.New("--timeout must be > 0")
@@ -61,44 +63,95 @@ type Result struct {
 }
 
 type options struct {
-	pulse    string // flag value, normalized to a full URL by validate
-	retries  int
-	timeout  int
-	always   bool
-	payload  string
-	version  bool
-	command  []string
-	template *template.Template // parsed payload, nil without --payload
+	pulse       string // flag value, normalized to a full URL by validate
+	retries     int
+	timeout     int
+	always      bool
+	payload     string
+	failOnPulse bool
+	version     bool
+	command     []string
+	template    *template.Template // parsed payload, nil without --payload
 }
 
-func main() { os.Exit(run(os.Args[1:])) }
-
-// warnf reports to stderr; there is nowhere left to report a failed write.
-func warnf(format string, a ...any) {
-	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: "+format+"\n", a...)
+// envVars maps flags to the environment variables that set their value when the flag is not given.
+//
+//nolint:gochecknoglobals // read-only table
+var envVars = []struct{ flag, name string }{
+	{"pulse", "UPDOWN_PULSE"},
+	{"retry", "UPDOWN_PULSE_RETRIES"},
+	{"timeout", "UPDOWN_PULSE_TIMEOUT"},
 }
 
-// newFlagSet binds the command-line flags to opts.
+const usage = `Usage: updownio-pulse [options] -- command [args...]
+
+Options:
+  -p, --pulse <pulse>        pulse URL (https://pulse.updown.io/xxxx/YYYYYYYY or xxxx/YYYYYYYY) [$UPDOWN_PULSE]
+  -r, --retry <n>            retries on network errors and HTTP 408, 429, 5xx (default %d) [$UPDOWN_PULSE_RETRIES]
+  -t, --timeout <seconds>    per-attempt request timeout (default %d) [$UPDOWN_PULSE_TIMEOUT]
+  -a, --always               send the pulse even when the command exits non-zero
+  -d, --payload <template>   Go template for the request body, sent via POST (fields: .ExitCode)
+  -f, --fail-on-pulse-error  exit with %d when the command succeeds but the pulse fails
+      --version              print version and exit
+  -h, --help                 print this help and exit
+
+Flags take precedence over environment variables.
+`
+
+func main() { os.Exit(run(os.Args[1:], os.Getenv)) }
+
+// warn reports to stderr; there is nowhere left to report a failed write.
+func warn(err error) {
+	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: %v\n", err)
+}
+
+// newFlagSet binds the command-line flags to opts. Help texts live in usage, which also lists the short aliases.
 func newFlagSet(opts *options) *flag.FlagSet {
 	flags := flag.NewFlagSet("updownio-pulse", flag.ContinueOnError)
 	flags.Usage = func() {
-		_, _ = fmt.Fprint(flags.Output(), "Usage: updownio-pulse --pulse <pulse> [options] -- command [args...]\n\n")
-		_, _ = fmt.Fprint(flags.Output(), "Options:\n")
-		flags.PrintDefaults()
+		_, _ = fmt.Fprintf(flags.Output(), usage, defaultRetries, defaultTimeout, exitTempFail)
 	}
 
-	const pulseHelp = "pulse URL (`https://pulse.updown.io/xxxx/YYYYYYYY` or `xxxx/YYYYYYYY`)"
-	flags.StringVar(&opts.pulse, "pulse", "", pulseHelp)
-	flags.IntVar(&opts.retries, "retry", defaultRetries, "retries on network errors and HTTP 408, 429, 5xx")
-	flags.IntVar(&opts.timeout, "timeout", defaultTimeout, "per-attempt request timeout, in seconds")
-	flags.BoolVar(&opts.always, "always", false, "send the pulse even when the command exits non-zero")
-	flags.StringVar(&opts.payload, "payload", "", "Go template for the request body, sent via POST (fields: .ExitCode)")
-	flags.BoolVar(&opts.version, "version", false, "print version and exit")
+	flags.StringVar(&opts.pulse, "pulse", "", "")
+	flags.IntVar(&opts.retries, "retry", defaultRetries, "")
+	flags.IntVar(&opts.timeout, "timeout", defaultTimeout, "")
+	flags.BoolVar(&opts.always, "always", false, "")
+	flags.StringVar(&opts.payload, "payload", "", "")
+	flags.BoolVar(&opts.failOnPulse, "fail-on-pulse-error", false, "")
+	flags.BoolVar(&opts.version, "version", false, "")
+
+	for short, long := range map[string]string{
+		"p": "pulse", "r": "retry", "t": "timeout", "a": "always", "d": "payload", "f": "fail-on-pulse-error",
+	} {
+		flags.Var(flags.Lookup(long).Value, short, "")
+	}
 
 	return flags
 }
 
-func run(args []string) int {
+// applyEnv sets the flags not given on the command line from their environment variables.
+func applyEnv(flags *flag.FlagSet, getenv func(string) string) error {
+	// Short aliases share the long flag's Value, so this catches both spellings.
+	given := map[flag.Value]bool{}
+
+	flags.Visit(func(f *flag.Flag) { given[f.Value] = true })
+
+	for _, env := range envVars {
+		value := getenv(env.name)
+		if value == "" || given[flags.Lookup(env.flag).Value] {
+			continue
+		}
+
+		err := flags.Set(env.flag, value)
+		if err != nil {
+			return fmt.Errorf("%w %s: %w", errInvalidEnv, env.name, err)
+		}
+	}
+
+	return nil
+}
+
+func run(args []string, getenv func(string) string) int {
 	var opts options
 
 	flags := newFlagSet(&opts)
@@ -120,22 +173,34 @@ func run(args []string) int {
 
 	opts.command = flags.Args()
 
-	err = opts.validate()
+	err = applyEnv(flags, getenv)
+	if err == nil {
+		err = opts.validate()
+	}
+
 	if err != nil {
-		warnf("%v", err)
+		warn(err)
 		flags.Usage()
 
 		return exitUsage
 	}
 
-	code := execute(opts.command)
+	return finish(&opts, execute(opts.command))
+}
+
+// finish sends the pulse, if due, after the command exited with code, and returns the wrapper's exit code.
+func finish(opts *options, code int) int {
 	if code != 0 && !opts.always {
 		return code
 	}
 
-	err = notify(&opts, code)
+	err := notify(opts, code)
 	if err != nil {
-		warnf("%v", err)
+		warn(err)
+
+		if opts.failOnPulse && code == 0 {
+			return exitTempFail
+		}
 	}
 
 	return code
@@ -206,7 +271,7 @@ func execute(command []string) int {
 
 	err := cmd.Start()
 	if err != nil {
-		warnf("%v", err)
+		warn(err)
 
 		if errors.Is(err, exec.ErrNotFound) || errors.Is(err, fs.ErrNotExist) {
 			return exitNotFound

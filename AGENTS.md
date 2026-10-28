@@ -32,8 +32,10 @@ Tests start a local HTTP server, so they need local port binding.
 
 These are deliberate decisions; don't change them without being asked:
 
-- The wrapper's exit code is always the command's: 128 + signal if killed, 127 not found, 126 not startable, 2 for invalid options.
-- A failed pulse is only reported on stderr and never changes the exit code.
+- The wrapper's exit code is the command's: 128 + signal if killed, 127 not found, 126 not startable, 2 for invalid options or environment variables.
+- A failed pulse is only reported on stderr and doesn't change the exit code, except with `--fail-on-pulse-error`: then 75 (`EX_TEMPFAIL`), only if the command succeeded.
+- `UPDOWN_PULSE`, `UPDOWN_PULSE_RETRIES`, `UPDOWN_PULSE_TIMEOUT` set `--pulse`, `--retry`, `--timeout`; precedence is flag > env > default. Other flags have no variable on purpose.
+- Flags are parsed with the stdlib `flag` package; short aliases share the long flag's `Value`, and the help text is the hand-written `usage` constant (keep it in sync).
 - Without `--always`, no pulse is sent when the command fails.
 - Without `--payload` the pulse is a GET; with it, a POST with the rendered template as body.
 - `--retry=N` means N retries after the first attempt (like `curl --retry`), only on network errors and HTTP 408, 429, 5xx.
