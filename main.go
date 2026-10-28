@@ -105,9 +105,8 @@ func warn(err error) {
 	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: %v\n", err)
 }
 
-// newFlagSet binds the command-line flags to opts, with values from the environment as defaults.
-// Help texts live in usage, which also lists the short aliases.
-func newFlagSet(opts *options, getenv func(string) string) (*flag.FlagSet, error) {
+// newFlagSet binds the command-line flags to opts. Help texts live in usage, which also lists the short aliases.
+func newFlagSet(opts *options) *flag.FlagSet {
 	flags := flag.NewFlagSet("updownio-pulse", flag.ContinueOnError)
 	flags.Usage = func() {
 		_, _ = fmt.Fprintf(flags.Output(), usage, defaultRetries, defaultTimeout, exitTempFail)
@@ -127,34 +126,37 @@ func newFlagSet(opts *options, getenv func(string) string) (*flag.FlagSet, error
 		flags.Var(flags.Lookup(long).Value, short, "")
 	}
 
-	// Set before parsing, so flags override them; usage keeps showing the built-in defaults.
+	return flags
+}
+
+// applyEnv sets the flags not given on the command line from their environment variables.
+func applyEnv(flags *flag.FlagSet, getenv func(string) string) error {
+	// Short aliases share the long flag's Value, so this catches both spellings.
+	given := map[flag.Value]bool{}
+
+	flags.Visit(func(f *flag.Flag) { given[f.Value] = true })
+
 	for _, env := range envVars {
 		value := getenv(env.name)
-		if value == "" {
+		if value == "" || given[flags.Lookup(env.flag).Value] {
 			continue
 		}
 
 		err := flags.Set(env.flag, value)
 		if err != nil {
-			return flags, fmt.Errorf("%w %s: %w", errInvalidEnv, env.name, err)
+			return fmt.Errorf("%w %s: %w", errInvalidEnv, env.name, err)
 		}
 	}
 
-	return flags, nil
+	return nil
 }
 
 func run(args []string, getenv func(string) string) int {
 	var opts options
 
-	flags, err := newFlagSet(&opts, getenv)
-	if err != nil {
-		warn(err)
-		flags.Usage()
+	flags := newFlagSet(&opts)
 
-		return exitUsage
-	}
-
-	err = flags.Parse(args)
+	err := flags.Parse(args)
 	if errors.Is(err, flag.ErrHelp) {
 		return 0
 	}
@@ -171,7 +173,11 @@ func run(args []string, getenv func(string) string) int {
 
 	opts.command = flags.Args()
 
-	err = opts.validate()
+	err = applyEnv(flags, getenv)
+	if err == nil {
+		err = opts.validate()
+	}
+
 	if err != nil {
 		warn(err)
 		flags.Usage()

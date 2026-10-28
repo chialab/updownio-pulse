@@ -215,6 +215,13 @@ func TestRunEnv(t *testing.T) {
 
 	testRun(t, []runCase{
 		{
+			"flag overrides invalid env",
+			map[string]string{"UPDOWN_PULSE_TIMEOUT": "abc", "UPDOWN_PULSE_RETRIES": "abc"},
+			0,
+			[]string{"-t", "5", "--retry=1", "--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
 			"pulse flag overrides env",
 			map[string]string{"UPDOWN_PULSE": "ftp://invalid/x"},
 			0,
