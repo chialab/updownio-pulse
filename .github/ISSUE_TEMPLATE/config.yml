@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/chialab/updownio-pulse/security/advisories/new
+    about: Please report security issues privately.
+  - name: updown.io pulse documentation
+    url: https://updown.io/doc/how-pulse-cron-monitoring-works
+    about: Questions about pulse checks themselves are best answered here.
