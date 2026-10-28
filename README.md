@@ -59,25 +59,31 @@ go install github.com/chialab/updownio-pulse@latest
 ## Usage
 
 ```sh
-updownio-pulse --pulse <pulse> [options] -- command [args...]
+updownio-pulse [options] -- command [args...]
 ```
 
-`<pulse>` is either the full URL (`https://pulse.updown.io/xxxx/YYYYYYYY`) or the short form (`xxxx/YYYYYYYY`).
+The pulse, given with `--pulse` or `UPDOWN_PULSE`, is either the full URL (`https://pulse.updown.io/xxxx/YYYYYYYY`) or the short form (`xxxx/YYYYYYYY`).
 
-| Option | Default | Description |
-|---|---|---|
-| `--retry=N` | `5` | Retries on network errors and HTTP 408, 429, 5xx, with exponential backoff. |
-| `--timeout=S` | `10` | Per-attempt request timeout, in seconds. |
-| `--always` | off | Send the pulse even when the command exits non-zero. |
-| `--payload=TPL` | none | [Go template](https://pkg.go.dev/text/template) sent as the request body via POST. Fields: `.ExitCode`. |
-| `--version` | | Print version and exit. |
+| Option | Environment variable | Default | Description |
+|---|---|---|---|
+| `-p`, `--pulse=URL` | `UPDOWN_PULSE` | | The pulse to send. Required. |
+| `-r`, `--retry=N` | `UPDOWN_PULSE_RETRIES` | `5` | Retries on network errors and HTTP 408, 429, 5xx, with exponential backoff. |
+| `-t`, `--timeout=S` | `UPDOWN_PULSE_TIMEOUT` | `10` | Per-attempt request timeout, in seconds. |
+| `-a`, `--always` | | off | Send the pulse even when the command exits non-zero. |
+| `-d`, `--payload=TPL` | | none | [Go template](https://pkg.go.dev/text/template) sent as the request body via POST. Fields: `.ExitCode`. |
+| `-f`, `--fail-on-pulse-error` | | off | Exit with 75 when the command succeeds but the pulse fails. |
+| `--version` | | | Print version and exit. |
+
+Flags take precedence over environment variables.
+Prefer `UPDOWN_PULSE` to `--pulse`: see [Security](#security).
 
 Without `--payload`, the pulse is a plain GET, and it is sent only when the command succeeds.
 
 ### Exit codes
 
-`updownio-pulse` always exits with the command's own exit code.
-A failed pulse is reported on stderr but never changes it: updown.io will flag the missing pulse anyway.
+`updownio-pulse` exits with the command's own exit code.
+A failed pulse is reported on stderr but doesn't change it, because updown.io flags the missing pulse anyway.
+To fail right away instead (e.g. in CI), use `--fail-on-pulse-error`.
 
 | Situation | Exit code |
 |---|---|
@@ -85,15 +91,19 @@ A failed pulse is reported on stderr but never changes it: updown.io will flag t
 | Command killed by a signal | 128 + signal number |
 | Command not found | 127 |
 | Command could not be started | 126 |
-| Invalid options | 2 |
+| Command succeeded, pulse failed, with `--fail-on-pulse-error` | 75 |
+| Invalid options or environment variables | 2 |
 
 ## Examples
 
 ### Cron job
 
 ```crontab
-0 3 * * * updownio-pulse --pulse xxxx/YYYYYYYY -- /opt/scripts/backup.sh
+UPDOWN_PULSE=xxxx/YYYYYYYY
+0 3 * * * updownio-pulse -- /opt/scripts/backup.sh
 ```
+
+The variable applies to every following line, so give each job its own pulse with `--pulse` or a per-line `UPDOWN_PULSE=... updownio-pulse ...` when needed.
 
 ### Report failures through the pulse body
 
@@ -128,7 +138,8 @@ Then set the check's "contains" field to `exit-code=0`: any other exit code mark
 ## Security
 
 Treat your pulse URL like a password: anyone who knows it can send pulses and hide real failures.
-Note that command-line arguments are visible to other users of the same machine (e.g. via `ps`).
+Command-line arguments are visible to other users of the same machine (e.g. via `ps`).
+Pass the URL through `UPDOWN_PULSE` instead, ideally from your secret store.
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
