@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -43,6 +44,39 @@ func TestPulseURL(t *testing.T) {
 		} else if err != nil || got != want {
 			t.Errorf("pulseURL(%q) = %q, %v; want %q", input, got, err, want)
 		}
+	}
+}
+
+func TestRedact(t *testing.T) {
+	t.Parallel()
+
+	//nolint:gosec // G101: fake credentials, to check they are stripped
+	for input, want := range map[string]string{
+		"https://pulse.updown.io/abcd/EFGH1234":       "https://pulse.updown.io/abcd/redacted",
+		"http://user:pass@localhost:8080/x/y/z?k=v#f": "http://localhost:8080/x/redacted",
+	} {
+		got := redact(input)
+		if got != want || strings.Contains(got, "EFGH1234") {
+			t.Errorf("redact(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestNewLogger(t *testing.T) {
+	t.Parallel()
+
+	var buf strings.Builder
+
+	newLogger(&buf, levelOff).Error("hidden")
+
+	if buf.Len() != 0 {
+		t.Errorf("default level logged %q, want nothing", buf.String())
+	}
+
+	newLogger(&buf, slog.LevelDebug).Debug("shown")
+
+	if !strings.Contains(buf.String(), "msg=shown") {
+		t.Errorf("debug level logged %q, want msg=shown", buf.String())
 	}
 }
 
@@ -134,7 +168,7 @@ func TestSendRetries(t *testing.T) {
 
 			srv, hits, _ := server(t, tc.statuses...)
 
-			err := send(srv.URL+"/x/y", nil, tc.retries, time.Second)
+			err := send(slog.New(slog.DiscardHandler), srv.URL+"/x/y", nil, tc.retries, time.Second)
 			if (err != nil) != tc.wantErr || hits.Load() != tc.wantHits {
 				t.Errorf(
 					"err=%v hits=%d; want err=%v hits=%d",
@@ -191,6 +225,18 @@ func testRun(t *testing.T, cases []runCase) {
 				)
 			}
 		})
+	}
+}
+
+func TestSendRedactsError(t *testing.T) {
+	t.Parallel()
+
+	srv, _, _ := server(t, http.StatusOK)
+	srv.Close() // connection refused: the error quotes the URL
+
+	err := send(slog.New(slog.DiscardHandler), srv.URL+"/x/SECRET", nil, 0, time.Second)
+	if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "/x/redacted") {
+		t.Errorf("send() error = %v, want it with the URL redacted", err)
 	}
 }
 
@@ -255,6 +301,20 @@ func TestRunEnv(t *testing.T) {
 		{
 			"env validated",
 			map[string]string{"UPDOWN_PULSE_TIMEOUT": "0"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			2, 0, "",
+		},
+		{
+			"log level",
+			map[string]string{"UPDOWN_PULSE_LOG": "debug"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
+			"invalid log level",
+			map[string]string{"UPDOWN_PULSE_LOG": "loud"},
 			0,
 			[]string{"--", "sh", "-c", "exit 0"},
 			2, 0, "",

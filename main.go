@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +38,8 @@ const (
 	exitSignalBase = 128 // shell convention: 128 + signal number
 
 	maxDrain = 64 << 10 // response bytes read so the connection can be reused
+
+	levelOff = slog.LevelError + 1 // above every level logged: silent by default
 )
 
 var version = "dev"
@@ -74,9 +77,11 @@ type options struct {
 	always      bool
 	payload     string
 	failOnPulse bool
+	logLevel    slog.Level
 	version     bool
 	command     []string
 	template    *template.Template // parsed payload, nil without --payload
+	log         *slog.Logger
 }
 
 // envVars maps flags to the environment variables that set their value when the flag is not given.
@@ -86,6 +91,7 @@ var envVars = []struct{ flag, name string }{
 	{"pulse", "UPDOWN_PULSE"},
 	{"retry", "UPDOWN_PULSE_RETRIES"},
 	{"timeout", "UPDOWN_PULSE_TIMEOUT"},
+	{"log-level", "UPDOWN_PULSE_LOG"},
 }
 
 const usage = `Usage: updownio-pulse [options] -- command [args...]
@@ -98,6 +104,7 @@ Options:
   -d, --payload <template>   Go template for the request body, sent via POST
                              (fields: .ExitCode, .Attempt, .Command, .StartedAt, .FinishedAt, .Duration)
   -f, --fail-on-pulse-error  exit with %d when the command succeeds but the pulse fails
+  -l, --log-level <level>    log to stderr from debug, info, warn or error up (default: off) [$UPDOWN_PULSE_LOG]
       --version              print version and exit
   -h, --help                 print this help and exit
 
@@ -106,7 +113,25 @@ Flags take precedence over environment variables.
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv)) }
 
-// warn reports to stderr; there is nowhere left to report a failed write.
+// newLogger logs to w from level up, as slog text. Errors that must always show use warn instead.
+func newLogger(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+}
+
+// redact hides the pulse URL's secret part, keeping its first path segment to tell pulses apart.
+func redact(pulse string) string {
+	parsed, err := url.Parse(pulse)
+	if err != nil {
+		return "redacted"
+	}
+
+	first, _, _ := strings.Cut(strings.TrimPrefix(parsed.Path, "/"), "/")
+	parsed.User, parsed.Path, parsed.RawQuery, parsed.Fragment = nil, "/"+first+"/redacted", "", ""
+
+	return parsed.String()
+}
+
+// warn reports to stderr, whatever the log level; there is nowhere left to report a failed write.
 func warn(err error) {
 	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: %v\n", err)
 }
@@ -124,10 +149,12 @@ func newFlagSet(opts *options) *flag.FlagSet {
 	flags.BoolVar(&opts.always, "always", false, "")
 	flags.StringVar(&opts.payload, "payload", "", "")
 	flags.BoolVar(&opts.failOnPulse, "fail-on-pulse-error", false, "")
+	flags.TextVar(&opts.logLevel, "log-level", levelOff, "")
 	flags.BoolVar(&opts.version, "version", false, "")
 
 	for short, long := range map[string]string{
 		"p": "pulse", "r": "retry", "t": "timeout", "a": "always", "d": "payload", "f": "fail-on-pulse-error",
+		"l": "log-level",
 	} {
 		flags.Var(flags.Lookup(long).Value, short, "")
 	}
@@ -191,9 +218,14 @@ func run(args []string, getenv func(string) string) int {
 		return exitUsage
 	}
 
+	opts.log = newLogger(os.Stderr, opts.logLevel)
+	opts.log.Debug("running command", "command", opts.command)
+
 	started := time.Now()
 	code := execute(opts.command)
 	finished := time.Now()
+
+	opts.log.Info("command exited", "exit_code", code, "duration", finished.Sub(started))
 
 	return finish(&opts, Result{
 		ExitCode:   code,
@@ -207,12 +239,14 @@ func run(args []string, getenv func(string) string) int {
 // finish sends the pulse, if due, after the command exited, and returns the wrapper's exit code.
 func finish(opts *options, result Result) int {
 	if result.ExitCode != 0 && !opts.always {
+		opts.log.Info("pulse skipped: the command failed, see --always")
+
 		return result.ExitCode
 	}
 
 	err := notify(opts, result)
 	if err != nil {
-		warn(err)
+		opts.log.Error("pulse failed", "error", err)
 
 		if opts.failOnPulse && result.ExitCode == 0 {
 			return exitTempFail
@@ -333,17 +367,20 @@ func notify(opts *options, result Result) error {
 		}
 	}
 
-	err := send(opts.pulse, render, opts.retries, time.Duration(opts.timeout)*time.Second)
-	if err != nil {
-		return fmt.Errorf("pulse failed: %w", err)
-	}
+	opts.log.Debug("sending pulse", "pulse", redact(opts.pulse), "post", render != nil)
 
-	return nil
+	return send(opts.log, opts.pulse, render, opts.retries, time.Duration(opts.timeout)*time.Second)
 }
 
 // send delivers the pulse, retrying transient failures like `curl --retry`.
 // With render, the pulse is a POST with the body it returns for each 1-based attempt; without, a GET.
-func send(target string, render func(attempt int) ([]byte, error), retries int, timeout time.Duration) error {
+func send(
+	log *slog.Logger,
+	target string,
+	render func(attempt int) ([]byte, error),
+	retries int,
+	timeout time.Duration,
+) error {
 	client := &http.Client{Timeout: timeout}
 
 	for attempt := 1; ; attempt++ {
@@ -358,12 +395,22 @@ func send(target string, render func(attempt int) ([]byte, error), retries int, 
 			}
 		}
 
+		log.Debug("pulse attempt", "attempt", attempt, "body_bytes", len(body))
+
 		retryable, err := sendOnce(client, target, body, render != nil)
-		if err == nil || !retryable || attempt > retries {
+		if err == nil {
+			log.Info("pulse sent", "attempt", attempt)
+
+			return nil
+		}
+
+		if !retryable || attempt > retries {
 			return err
 		}
 
-		time.Sleep(backoff(attempt - 1))
+		wait := backoff(attempt - 1)
+		log.Warn("pulse attempt failed, retrying", "attempt", attempt, "error", err, "backoff", wait)
+		time.Sleep(wait)
 	}
 }
 
@@ -386,6 +433,12 @@ func sendOnce(client *http.Client, target string, body []byte, post bool) (bool,
 
 	resp, err := client.Do(req)
 	if err != nil {
+		// The error quotes the URL: hide its secret part, as it ends up in the logs.
+		urlErr, ok := errors.AsType[*url.Error](err)
+		if ok {
+			urlErr.URL = redact(urlErr.URL)
+		}
+
 		return true, fmt.Errorf("request: %w", err)
 	}
 

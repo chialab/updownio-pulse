@@ -72,6 +72,7 @@ The pulse, given with `--pulse` or `UPDOWN_PULSE`, is either the full URL (`http
 | `-a`, `--always` | | off | Send the pulse even when the command exits non-zero. |
 | `-d`, `--payload=TPL` | | none | [Go template](https://pkg.go.dev/text/template) sent as the request body via POST. See [payload fields](#payload-fields). |
 | `-f`, `--fail-on-pulse-error` | | off | Exit with 75 when the command succeeds but the pulse fails. |
+| `-l`, `--log-level=LEVEL` | `UPDOWN_PULSE_LOG` | off | Log to stderr from `debug`, `info`, `warn` or `error` up. See [logging](#logging). |
 | `--version` | | | Print version and exit. |
 
 Flags take precedence over environment variables.
@@ -96,7 +97,7 @@ Without `--payload`, the pulse is a plain GET, and it is sent only when the comm
 ### Exit codes
 
 `updownio-pulse` exits with the command's own exit code.
-A failed pulse is reported on stderr but doesn't change it, because updown.io flags the missing pulse anyway.
+A failed pulse doesn't change it, because updown.io flags the missing pulse anyway.
 To fail right away instead (e.g. in CI), use `--fail-on-pulse-error`.
 
 | Situation | Exit code |
@@ -107,6 +108,27 @@ To fail right away instead (e.g. in CI), use `--fail-on-pulse-error`.
 | Command could not be started | 126 |
 | Command succeeded, pulse failed, with `--fail-on-pulse-error` | 75 |
 | Invalid options or environment variables | 2 |
+
+### Logging
+
+By default `updownio-pulse` is silent: only the wrapped command writes to stdout and stderr.
+The only exceptions are invalid options and a command that can't be started, which are always reported.
+
+To see what happens, set a log level with `--log-level` or `UPDOWN_PULSE_LOG`.
+Each level includes the ones below it:
+
+| Level | What is logged |
+|---|---|
+| `error` | The pulse failed after all retries. |
+| `warn` | A pulse attempt failed and will be retried. |
+| `info` | The command's exit code and duration, the pulse sent or skipped. |
+| `debug` | The command, the pulse URL (redacted), each attempt and its payload size. |
+
+```sh
+$ UPDOWN_PULSE_LOG=info updownio-pulse -- ./backup.sh
+time=2026-10-28T03:00:12.345+01:00 level=INFO msg="command exited" exit_code=0 duration=12.3s
+time=2026-10-28T03:00:12.512+01:00 level=INFO msg="pulse sent" attempt=1
+```
 
 ## Examples
 
