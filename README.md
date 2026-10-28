@@ -70,7 +70,7 @@ The pulse, given with `--pulse` or `UPDOWN_PULSE`, is either the full URL (`http
 | `-r`, `--retry=N` | `UPDOWN_PULSE_RETRIES` | `5` | Retries on network errors and HTTP 408, 429, 5xx, with exponential backoff. |
 | `-t`, `--timeout=S` | `UPDOWN_PULSE_TIMEOUT` | `10` | Per-attempt request timeout, in seconds. |
 | `-a`, `--always` | | off | Send the pulse even when the command exits non-zero. |
-| `-d`, `--payload=TPL` | | none | [Go template](https://pkg.go.dev/text/template) sent as the request body via POST. Fields: `.ExitCode`. |
+| `-d`, `--payload=TPL` | | none | [Go template](https://pkg.go.dev/text/template) sent as the request body via POST. See [payload fields](#payload-fields). |
 | `-f`, `--fail-on-pulse-error` | | off | Exit with 75 when the command succeeds but the pulse fails. |
 | `--version` | | | Print version and exit. |
 
@@ -78,6 +78,20 @@ Flags take precedence over environment variables.
 Prefer `UPDOWN_PULSE` to `--pulse`: see [Security](#security).
 
 Without `--payload`, the pulse is a plain GET, and it is sent only when the command succeeds.
+
+### Payload fields
+
+| Field | Type | Description |
+|---|---|---|
+| `.ExitCode` | `int` | The command's exit code, as returned by `updownio-pulse`. |
+| `.Attempt` | `int` | 1-based attempt number of the pulse request: greater than 1 after retries. The payload is rendered for each attempt. |
+| `.Command` | `[]string` | Command and arguments, as executed. |
+| `.StartedAt` | `time.Time` | When the command started, e.g. `{{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}}`. |
+| `.FinishedAt` | `time.Time` | When the command exited. |
+| `.Duration` | `time.Duration` | How long the command ran, e.g. `1m2.5s`. |
+
+> [!WARNING]
+> `.Command` sends the command line to updown.io: don't use it if the arguments contain secrets.
 
 ### Exit codes
 

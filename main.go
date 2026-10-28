@@ -59,7 +59,12 @@ var backoff = func(i int) time.Duration { return time.Second << min(i, maxBackof
 
 // Result is the data available to the --payload template.
 type Result struct {
-	ExitCode int
+	ExitCode   int
+	Attempt    int      // 1-based pulse request attempt, the template is rendered for each
+	Command    []string // command and arguments, as executed
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Duration   time.Duration
 }
 
 type options struct {
@@ -90,7 +95,8 @@ Options:
   -r, --retry <n>            retries on network errors and HTTP 408, 429, 5xx (default %d) [$UPDOWN_PULSE_RETRIES]
   -t, --timeout <seconds>    per-attempt request timeout (default %d) [$UPDOWN_PULSE_TIMEOUT]
   -a, --always               send the pulse even when the command exits non-zero
-  -d, --payload <template>   Go template for the request body, sent via POST (fields: .ExitCode)
+  -d, --payload <template>   Go template for the request body, sent via POST
+                             (fields: .ExitCode, .Attempt, .Command, .StartedAt, .FinishedAt, .Duration)
   -f, --fail-on-pulse-error  exit with %d when the command succeeds but the pulse fails
       --version              print version and exit
   -h, --help                 print this help and exit
@@ -185,25 +191,35 @@ func run(args []string, getenv func(string) string) int {
 		return exitUsage
 	}
 
-	return finish(&opts, execute(opts.command))
+	started := time.Now()
+	code := execute(opts.command)
+	finished := time.Now()
+
+	return finish(&opts, Result{
+		ExitCode:   code,
+		Command:    opts.command,
+		StartedAt:  started.Round(0), // drops the monotonic reading, which would show up when printed
+		FinishedAt: finished.Round(0),
+		Duration:   finished.Sub(started),
+	})
 }
 
-// finish sends the pulse, if due, after the command exited with code, and returns the wrapper's exit code.
-func finish(opts *options, code int) int {
-	if code != 0 && !opts.always {
-		return code
+// finish sends the pulse, if due, after the command exited, and returns the wrapper's exit code.
+func finish(opts *options, result Result) int {
+	if result.ExitCode != 0 && !opts.always {
+		return result.ExitCode
 	}
 
-	err := notify(opts, code)
+	err := notify(opts, result)
 	if err != nil {
 		warn(err)
 
-		if opts.failOnPulse && code == 0 {
+		if opts.failOnPulse && result.ExitCode == 0 {
 			return exitTempFail
 		}
 	}
 
-	return code
+	return result.ExitCode
 }
 
 // validate checks the options before the command runs, so mistakes fail fast.
@@ -229,7 +245,7 @@ func (o *options) validate() error {
 	o.template, err = template.New("payload").Parse(o.payload)
 	if err == nil {
 		// Dry run so unknown fields fail now, not after the command ran.
-		err = o.template.Execute(io.Discard, Result{})
+		err = o.template.Execute(io.Discard, Result{Attempt: 1, Command: o.command})
 	}
 
 	if err != nil {
@@ -298,28 +314,26 @@ func execute(command []string) int {
 	return code
 }
 
-// notify renders the payload, if any, and sends the pulse.
-func notify(opts *options, code int) error {
-	var body []byte
+// notify sends the pulse, with the payload, if any, rendered for each attempt.
+func notify(opts *options, result Result) error {
+	var render func(attempt int) ([]byte, error)
 
 	if opts.template != nil {
-		var buf bytes.Buffer
+		render = func(attempt int) ([]byte, error) {
+			var buf bytes.Buffer
 
-		err := opts.template.Execute(&buf, Result{ExitCode: code})
-		if err != nil {
-			return fmt.Errorf("payload: %w", err)
+			result.Attempt = attempt
+
+			err := opts.template.Execute(&buf, result)
+			if err != nil {
+				return nil, fmt.Errorf("payload: %w", err)
+			}
+
+			return buf.Bytes(), nil
 		}
-
-		body = buf.Bytes()
 	}
 
-	err := send(
-		opts.pulse,
-		body,
-		opts.template != nil,
-		opts.retries,
-		time.Duration(opts.timeout)*time.Second,
-	)
+	err := send(opts.pulse, render, opts.retries, time.Duration(opts.timeout)*time.Second)
 	if err != nil {
 		return fmt.Errorf("pulse failed: %w", err)
 	}
@@ -328,16 +342,28 @@ func notify(opts *options, code int) error {
 }
 
 // send delivers the pulse, retrying transient failures like `curl --retry`.
-func send(target string, body []byte, post bool, retries int, timeout time.Duration) error {
+// With render, the pulse is a POST with the body it returns for each 1-based attempt; without, a GET.
+func send(target string, render func(attempt int) ([]byte, error), retries int, timeout time.Duration) error {
 	client := &http.Client{Timeout: timeout}
 
-	for attempt := 0; ; attempt++ {
-		retryable, err := sendOnce(client, target, body, post)
-		if err == nil || !retryable || attempt >= retries {
+	for attempt := 1; ; attempt++ {
+		var body []byte
+
+		if render != nil {
+			var err error
+
+			body, err = render(attempt)
+			if err != nil {
+				return err
+			}
+		}
+
+		retryable, err := sendOnce(client, target, body, render != nil)
+		if err == nil || !retryable || attempt > retries {
 			return err
 		}
 
-		time.Sleep(backoff(attempt))
+		time.Sleep(backoff(attempt - 1))
 	}
 }
 

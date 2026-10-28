@@ -67,6 +67,16 @@ func TestValidate(t *testing.T) {
 		{"missing command", func(o *options) { o.command = nil }, errMissingCommand},
 		{"bad template", func(o *options) { o.payload = "{{" }, errInvalidPayload},
 		{"unknown field", func(o *options) { o.payload = "{{.Nope}}" }, errInvalidPayload},
+		{"command index", func(o *options) { o.payload = "{{index .Command 0}}" }, nil},
+		{
+			"zero time fields", // the dry run leaves them zero: common uses must not fail on it
+			func(o *options) {
+				o.payload = `{{.StartedAt}} {{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}} ` +
+					`{{.FinishedAt.Unix}} {{.Duration}} {{.Duration.Seconds}} {{.Attempt}} {{.ExitCode}}`
+			},
+			nil,
+		},
+		{"command index out of range", func(o *options) { o.payload = "{{index .Command 1}}" }, errInvalidPayload},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,7 +134,7 @@ func TestSendRetries(t *testing.T) {
 
 			srv, hits, _ := server(t, tc.statuses...)
 
-			err := send(srv.URL+"/x/y", nil, false, tc.retries, time.Second)
+			err := send(srv.URL+"/x/y", nil, tc.retries, time.Second)
 			if (err != nil) != tc.wantErr || hits.Load() != tc.wantHits {
 				t.Errorf(
 					"err=%v hits=%d; want err=%v hits=%d",
@@ -257,6 +267,25 @@ func TestRunEnv(t *testing.T) {
 			0, 1, "GET ",
 		},
 	})
+}
+
+func TestPayloadFields(t *testing.T) {
+	t.Parallel()
+
+	srv, hits, last := server(t, http.StatusServiceUnavailable, http.StatusOK)
+
+	payload := "{{.ExitCode}} {{.Attempt}} {{.Command}} {{not .StartedAt.IsZero}} " +
+		"{{.FinishedAt.Before .StartedAt}} {{ge .Duration.Nanoseconds 0}}"
+	cmd := []string{"go", "version"} // a portable command that exists wherever the tests run
+
+	code := run(append([]string{"--payload", payload, "--"}, cmd...), func(k string) string {
+		return map[string]string{"UPDOWN_PULSE": srv.URL + "/x/y"}[k]
+	})
+
+	want := "POST 0 2 [go version] true false true" // second attempt, after the 503
+	if code != 0 || hits.Load() != 2 || *last != want {
+		t.Errorf("code=%d hits=%d last=%q; want 0 2 %q", code, hits.Load(), *last, want)
+	}
 }
 
 func TestRunPulseError(t *testing.T) {

@@ -37,7 +37,7 @@ These are deliberate decisions; don't change them without being asked:
 - `UPDOWN_PULSE`, `UPDOWN_PULSE_RETRIES`, `UPDOWN_PULSE_TIMEOUT` set `--pulse`, `--retry`, `--timeout`; precedence is flag > env > default. Other flags have no variable on purpose.
 - Flags are parsed with the stdlib `flag` package; short aliases share the long flag's `Value`, and the help text is the hand-written `usage` constant (keep it in sync).
 - Without `--always`, no pulse is sent when the command fails.
-- Without `--payload` the pulse is a GET; with it, a POST with the rendered template as body.
+- Without `--payload` the pulse is a GET; with it, a POST with the template rendered for each attempt (`.Attempt` changes) as body. Template fields are the exported fields of `Result`; keep README's payload fields table and `usage` in sync.
 - `--retry=N` means N retries after the first attempt (like `curl --retry`), only on network errors and HTTP 408, 429, 5xx.
 - Options, including the payload template, are validated before running the command.
 - No buffering of stdout/stderr: output streams through untouched.
