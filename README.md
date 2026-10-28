@@ -41,6 +41,15 @@ curl -fsSL https://github.com/chialab/updownio-pulse/releases/latest/download/up
 
 Checksums are published alongside each release in `checksums.txt`.
 
+### Verifying artifacts
+
+Archives and images come with [build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), proving they were built by this repository's release workflow:
+
+```sh
+gh attestation verify updownio-pulse_linux_amd64.tar.gz --repo chialab/updownio-pulse
+gh attestation verify oci://ghcr.io/chialab/updownio-pulse:latest --repo chialab/updownio-pulse
+```
+
 ### From source
 
 ```sh

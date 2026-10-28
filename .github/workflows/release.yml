@@ -18,6 +18,8 @@ jobs:
     permissions:
       contents: write # GitHub release
       packages: write # ghcr.io
+      id-token: write # sign attestations (Sigstore OIDC)
+      attestations: write # store attestations
     steps:
       - uses: actions/checkout@v7
         with:
@@ -39,3 +41,20 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Attest archives
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-checksums: dist/checksums.txt
+      - name: Resolve image digest
+        id: image
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          digest=$(docker buildx imagetools inspect "ghcr.io/${GITHUB_REPOSITORY}:${TAG#v}" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+      - name: Attest image
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.image.outputs.digest }}
+          push-to-registry: true
