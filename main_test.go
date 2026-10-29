@@ -17,7 +17,14 @@ import (
 	"time"
 )
 
+// runMainEnv makes the test binary behave as updownio-pulse, so tests can check what reaches stderr.
+const runMainEnv = "UPDOWNIO_PULSE_TEST_MAIN"
+
 func TestMain(m *testing.M) {
+	if os.Getenv(runMainEnv) == "1" {
+		main()
+	}
+
 	backoff = func(int) time.Duration { return 0 }
 
 	os.Exit(m.Run())
@@ -274,6 +281,30 @@ func TestRun(t *testing.T) {
 		{"not found", nil, 0, []string{"--always", "--", "./does-not-exist"}, 127, 1, "GET "},
 		{"usage error", nil, 0, []string{"--timeout=0", "--", "sh", "-c", "exit 0"}, 2, 0, ""},
 	})
+}
+
+func TestUnknownFlag(t *testing.T) {
+	t.Parallel()
+
+	cmd := exec.CommandContext(t.Context(), os.Args[0], "-x") //nolint:gosec // re-runs this test binary as the CLI
+
+	cmd.Env = append(os.Environ(), runMainEnv+"=1")
+
+	var stderr strings.Builder
+
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != exitUsage {
+		t.Fatalf("err = %v, want exit code %d", err, exitUsage)
+	}
+
+	want := "updownio-pulse: flag provided but not defined: -x\nUsage: "
+	if !strings.HasPrefix(stderr.String(), want) {
+		t.Errorf("stderr = %q, want prefix %q", stderr.String(), want)
+	}
 }
 
 func TestRunEnv(t *testing.T) {

@@ -136,12 +136,16 @@ func warn(err error) {
 	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: %v\n", err)
 }
 
+// printUsage writes the help text to stderr.
+func printUsage() {
+	_, _ = fmt.Fprintf(os.Stderr, usage, defaultRetries, defaultTimeout, exitTempFail)
+}
+
 // newFlagSet binds the command-line flags to opts. Help texts live in usage, which also lists the short aliases.
 func newFlagSet(opts *options) *flag.FlagSet {
 	flags := flag.NewFlagSet("updownio-pulse", flag.ContinueOnError)
-	flags.Usage = func() {
-		_, _ = fmt.Fprintf(flags.Output(), usage, defaultRetries, defaultTimeout, exitTempFail)
-	}
+	// Parse errors are reported by run through warn, with the usual prefix.
+	flags.SetOutput(io.Discard)
 
 	flags.StringVar(&opts.pulse, "pulse", "", "")
 	flags.IntVar(&opts.retries, "retry", defaultRetries, "")
@@ -191,10 +195,15 @@ func run(args []string, getenv func(string) string) int {
 
 	err := flags.Parse(args)
 	if errors.Is(err, flag.ErrHelp) {
+		printUsage()
+
 		return 0
 	}
 
 	if err != nil {
+		warn(err)
+		printUsage()
+
 		return exitUsage
 	}
 
@@ -213,7 +222,7 @@ func run(args []string, getenv func(string) string) int {
 
 	if err != nil {
 		warn(err)
-		flags.Usage()
+		printUsage()
 
 		return exitUsage
 	}
