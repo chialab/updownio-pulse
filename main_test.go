@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"errors"
 	"io"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -46,6 +47,40 @@ func TestPulseURL(t *testing.T) {
 	}
 }
 
+func TestRedact(t *testing.T) {
+	t.Parallel()
+
+	//nolint:gosec // G101: fake credentials, to check they are stripped
+	for input, want := range map[string]string{
+		"https://pulse.updown.io/abcd/EFGH1234":       "https://pulse.updown.io/abcd/redacted",
+		"http://user:pass@localhost:8080/x/y/z?k=v#f": "http://localhost:8080/x/redacted",
+		"https:abcd/EFGH1234":                         "redacted",
+	} {
+		got := redact(input)
+		if got != want || strings.Contains(got, "EFGH1234") {
+			t.Errorf("redact(%q) = %q, want %q", input, got, want)
+		}
+	}
+}
+
+func TestNewLogger(t *testing.T) {
+	t.Parallel()
+
+	var buf strings.Builder
+
+	newLogger(&buf, levelOff).Error("hidden")
+
+	if buf.Len() != 0 {
+		t.Errorf("default level logged %q, want nothing", buf.String())
+	}
+
+	newLogger(&buf, slog.LevelDebug).Debug("shown")
+
+	if !strings.Contains(buf.String(), "msg=shown") {
+		t.Errorf("debug level logged %q, want msg=shown", buf.String())
+	}
+}
+
 func TestValidate(t *testing.T) {
 	t.Parallel()
 
@@ -67,6 +102,16 @@ func TestValidate(t *testing.T) {
 		{"missing command", func(o *options) { o.command = nil }, errMissingCommand},
 		{"bad template", func(o *options) { o.payload = "{{" }, errInvalidPayload},
 		{"unknown field", func(o *options) { o.payload = "{{.Nope}}" }, errInvalidPayload},
+		{"command index", func(o *options) { o.payload = "{{index .Command 0}}" }, nil},
+		{
+			"zero time fields", // the dry run leaves them zero: common uses must not fail on it
+			func(o *options) {
+				o.payload = `{{.StartedAt}} {{.StartedAt.Format "2006-01-02T15:04:05Z07:00"}} ` +
+					`{{.FinishedAt.Unix}} {{.Duration}} {{.Duration.Seconds}} {{.Attempt}} {{.ExitCode}}`
+			},
+			nil,
+		},
+		{"command index out of range", func(o *options) { o.payload = "{{index .Command 1}}" }, errInvalidPayload},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -124,7 +169,7 @@ func TestSendRetries(t *testing.T) {
 
 			srv, hits, _ := server(t, tc.statuses...)
 
-			err := send(srv.URL+"/x/y", nil, false, tc.retries, time.Second)
+			err := send(slog.New(slog.DiscardHandler), srv.URL+"/x/y", nil, tc.retries, time.Second)
 			if (err != nil) != tc.wantErr || hits.Load() != tc.wantHits {
 				t.Errorf(
 					"err=%v hits=%d; want err=%v hits=%d",
@@ -181,6 +226,27 @@ func testRun(t *testing.T, cases []runCase) {
 				)
 			}
 		})
+	}
+}
+
+func TestSendRedactsError(t *testing.T) {
+	t.Parallel()
+
+	refused, _, _ := server(t, http.StatusOK)
+	refused.Close() // connection refused: the error quotes the URL
+
+	// A malformed redirect: the error quotes the Location too.
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/x/SECRET%")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+
+	for _, base := range []string{refused.URL, redirect.URL} {
+		err := send(slog.New(slog.DiscardHandler), base+"/x/SECRET", nil, 0, time.Second)
+		if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "/x/redacted") {
+			t.Errorf("send() error = %v, want it with the URL redacted", err)
+		}
 	}
 }
 
@@ -250,6 +316,20 @@ func TestRunEnv(t *testing.T) {
 			2, 0, "",
 		},
 		{
+			"log level",
+			map[string]string{"UPDOWN_PULSE_LOG": "debug"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			0, 1, "GET ",
+		},
+		{
+			"invalid log level",
+			map[string]string{"UPDOWN_PULSE_LOG": "loud"},
+			0,
+			[]string{"--", "sh", "-c", "exit 0"},
+			2, 0, "",
+		},
+		{
 			"flag overrides env",
 			map[string]string{"UPDOWN_PULSE_TIMEOUT": "0"},
 			0,
@@ -257,6 +337,25 @@ func TestRunEnv(t *testing.T) {
 			0, 1, "GET ",
 		},
 	})
+}
+
+func TestPayloadFields(t *testing.T) {
+	t.Parallel()
+
+	srv, hits, last := server(t, http.StatusServiceUnavailable, http.StatusOK)
+
+	payload := "{{.ExitCode}} {{.Attempt}} {{.Command}} {{not .StartedAt.IsZero}} " +
+		"{{.FinishedAt.Before .StartedAt}} {{ge .Duration.Nanoseconds 0}}"
+	cmd := []string{"go", "version"} // a portable command that exists wherever the tests run
+
+	code := run(append([]string{"--payload", payload, "--"}, cmd...), func(k string) string {
+		return map[string]string{"UPDOWN_PULSE": srv.URL + "/x/y"}[k]
+	})
+
+	want := "POST 0 2 [go version] true false true" // second attempt, after the 503
+	if code != 0 || hits.Load() != 2 || *last != want {
+		t.Errorf("code=%d hits=%d last=%q; want 0 2 %q", code, hits.Load(), *last, want)
+	}
 }
 
 func TestRunPulseError(t *testing.T) {

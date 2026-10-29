@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -37,6 +38,8 @@ const (
 	exitSignalBase = 128 // shell convention: 128 + signal number
 
 	maxDrain = 64 << 10 // response bytes read so the connection can be reused
+
+	levelOff = slog.LevelError + 1 // above every level logged: silent by default
 )
 
 var version = "dev"
@@ -59,7 +62,12 @@ var backoff = func(i int) time.Duration { return time.Second << min(i, maxBackof
 
 // Result is the data available to the --payload template.
 type Result struct {
-	ExitCode int
+	ExitCode   int
+	Attempt    int      // 1-based pulse request attempt, the template is rendered for each
+	Command    []string // command and arguments, as executed
+	StartedAt  time.Time
+	FinishedAt time.Time
+	Duration   time.Duration
 }
 
 type options struct {
@@ -69,9 +77,11 @@ type options struct {
 	always      bool
 	payload     string
 	failOnPulse bool
+	logLevel    slog.Level
 	version     bool
 	command     []string
 	template    *template.Template // parsed payload, nil without --payload
+	log         *slog.Logger
 }
 
 // envVars maps flags to the environment variables that set their value when the flag is not given.
@@ -81,6 +91,7 @@ var envVars = []struct{ flag, name string }{
 	{"pulse", "UPDOWN_PULSE"},
 	{"retry", "UPDOWN_PULSE_RETRIES"},
 	{"timeout", "UPDOWN_PULSE_TIMEOUT"},
+	{"log-level", "UPDOWN_PULSE_LOG"},
 }
 
 const usage = `Usage: updownio-pulse [options] -- command [args...]
@@ -90,8 +101,10 @@ Options:
   -r, --retry <n>            retries on network errors and HTTP 408, 429, 5xx (default %d) [$UPDOWN_PULSE_RETRIES]
   -t, --timeout <seconds>    per-attempt request timeout (default %d) [$UPDOWN_PULSE_TIMEOUT]
   -a, --always               send the pulse even when the command exits non-zero
-  -d, --payload <template>   Go template for the request body, sent via POST (fields: .ExitCode)
+  -d, --payload <template>   Go template for the request body, sent via POST
+                             (fields: .ExitCode, .Attempt, .Command, .StartedAt, .FinishedAt, .Duration)
   -f, --fail-on-pulse-error  exit with %d when the command succeeds but the pulse fails
+  -l, --log-level <level>    log to stderr from debug, info, warn or error up (default: off) [$UPDOWN_PULSE_LOG]
       --version              print version and exit
   -h, --help                 print this help and exit
 
@@ -100,7 +113,25 @@ Flags take precedence over environment variables.
 
 func main() { os.Exit(run(os.Args[1:], os.Getenv)) }
 
-// warn reports to stderr; there is nowhere left to report a failed write.
+// newLogger logs to w from level up, as slog text. Errors that must always show use warn instead.
+func newLogger(w io.Writer, level slog.Level) *slog.Logger {
+	return slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level}))
+}
+
+// redact hides the pulse URL's secret part, keeping its first path segment to tell pulses apart.
+func redact(pulse string) string {
+	parsed, err := url.Parse(pulse)
+	if err != nil || parsed.Opaque != "" { // String() prints Opaque, not Path, which would leak
+		return "redacted"
+	}
+
+	first, _, _ := strings.Cut(strings.TrimPrefix(parsed.Path, "/"), "/")
+	parsed.User, parsed.Path, parsed.RawQuery, parsed.Fragment = nil, "/"+first+"/redacted", "", ""
+
+	return parsed.String()
+}
+
+// warn reports to stderr, whatever the log level; there is nowhere left to report a failed write.
 func warn(err error) {
 	_, _ = fmt.Fprintf(os.Stderr, "updownio-pulse: %v\n", err)
 }
@@ -118,10 +149,12 @@ func newFlagSet(opts *options) *flag.FlagSet {
 	flags.BoolVar(&opts.always, "always", false, "")
 	flags.StringVar(&opts.payload, "payload", "", "")
 	flags.BoolVar(&opts.failOnPulse, "fail-on-pulse-error", false, "")
+	flags.TextVar(&opts.logLevel, "log-level", levelOff, "")
 	flags.BoolVar(&opts.version, "version", false, "")
 
 	for short, long := range map[string]string{
 		"p": "pulse", "r": "retry", "t": "timeout", "a": "always", "d": "payload", "f": "fail-on-pulse-error",
+		"l": "log-level",
 	} {
 		flags.Var(flags.Lookup(long).Value, short, "")
 	}
@@ -185,25 +218,42 @@ func run(args []string, getenv func(string) string) int {
 		return exitUsage
 	}
 
-	return finish(&opts, execute(opts.command))
+	opts.log = newLogger(os.Stderr, opts.logLevel)
+	opts.log.Debug("running command", "command", opts.command)
+
+	started := time.Now()
+	code := execute(opts.command)
+	finished := time.Now()
+
+	opts.log.Info("command exited", "exit_code", code, "duration", finished.Sub(started))
+
+	return finish(&opts, Result{
+		ExitCode:   code,
+		Command:    opts.command,
+		StartedAt:  started.Round(0), // drops the monotonic reading, which would show up when printed
+		FinishedAt: finished.Round(0),
+		Duration:   finished.Sub(started),
+	})
 }
 
-// finish sends the pulse, if due, after the command exited with code, and returns the wrapper's exit code.
-func finish(opts *options, code int) int {
-	if code != 0 && !opts.always {
-		return code
+// finish sends the pulse, if due, after the command exited, and returns the wrapper's exit code.
+func finish(opts *options, result Result) int {
+	if result.ExitCode != 0 && !opts.always {
+		opts.log.Info("pulse skipped: the command failed, see --always")
+
+		return result.ExitCode
 	}
 
-	err := notify(opts, code)
+	err := notify(opts, result)
 	if err != nil {
-		warn(err)
+		opts.log.Error("pulse failed", "error", err)
 
-		if opts.failOnPulse && code == 0 {
+		if opts.failOnPulse && result.ExitCode == 0 {
 			return exitTempFail
 		}
 	}
 
-	return code
+	return result.ExitCode
 }
 
 // validate checks the options before the command runs, so mistakes fail fast.
@@ -229,7 +279,7 @@ func (o *options) validate() error {
 	o.template, err = template.New("payload").Parse(o.payload)
 	if err == nil {
 		// Dry run so unknown fields fail now, not after the command ran.
-		err = o.template.Execute(io.Discard, Result{})
+		err = o.template.Execute(io.Discard, Result{Attempt: 1, Command: o.command})
 	}
 
 	if err != nil {
@@ -298,46 +348,69 @@ func execute(command []string) int {
 	return code
 }
 
-// notify renders the payload, if any, and sends the pulse.
-func notify(opts *options, code int) error {
-	var body []byte
+// notify sends the pulse, with the payload, if any, rendered for each attempt.
+func notify(opts *options, result Result) error {
+	var render func(attempt int) ([]byte, error)
 
 	if opts.template != nil {
-		var buf bytes.Buffer
+		render = func(attempt int) ([]byte, error) {
+			var buf bytes.Buffer
 
-		err := opts.template.Execute(&buf, Result{ExitCode: code})
-		if err != nil {
-			return fmt.Errorf("payload: %w", err)
+			result.Attempt = attempt
+
+			err := opts.template.Execute(&buf, result)
+			if err != nil {
+				return nil, fmt.Errorf("payload: %w", err)
+			}
+
+			return buf.Bytes(), nil
 		}
-
-		body = buf.Bytes()
 	}
 
-	err := send(
-		opts.pulse,
-		body,
-		opts.template != nil,
-		opts.retries,
-		time.Duration(opts.timeout)*time.Second,
-	)
-	if err != nil {
-		return fmt.Errorf("pulse failed: %w", err)
-	}
+	opts.log.Debug("sending pulse", "pulse", redact(opts.pulse), "post", render != nil)
 
-	return nil
+	return send(opts.log, opts.pulse, render, opts.retries, time.Duration(opts.timeout)*time.Second)
 }
 
 // send delivers the pulse, retrying transient failures like `curl --retry`.
-func send(target string, body []byte, post bool, retries int, timeout time.Duration) error {
+// With render, the pulse is a POST with the body it returns for each 1-based attempt; without, a GET.
+func send(
+	log *slog.Logger,
+	target string,
+	render func(attempt int) ([]byte, error),
+	retries int,
+	timeout time.Duration,
+) error {
 	client := &http.Client{Timeout: timeout}
 
-	for attempt := 0; ; attempt++ {
-		retryable, err := sendOnce(client, target, body, post)
-		if err == nil || !retryable || attempt >= retries {
+	for attempt := 1; ; attempt++ {
+		var body []byte
+
+		if render != nil {
+			var err error
+
+			body, err = render(attempt)
+			if err != nil {
+				return err
+			}
+		}
+
+		log.Debug("pulse attempt", "attempt", attempt, "body_bytes", len(body))
+
+		retryable, err := sendOnce(client, target, body, render != nil)
+		if err == nil {
+			log.Info("pulse sent", "attempt", attempt)
+
+			return nil
+		}
+
+		if !retryable || attempt > retries {
 			return err
 		}
 
-		time.Sleep(backoff(attempt))
+		wait := backoff(attempt - 1)
+		log.Warn("pulse attempt failed, retrying", "attempt", attempt, "error", err, "backoff", wait)
+		time.Sleep(wait)
 	}
 }
 
@@ -360,7 +433,10 @@ func sendOnce(client *http.Client, target string, body []byte, post bool) (bool,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return true, fmt.Errorf("request: %w", err)
+		// The error quotes the URL, and redirect ones too: hide the secret part, as it ends up in the logs.
+		_, secret, _ := strings.Cut(strings.TrimPrefix(req.URL.EscapedPath(), "/"), "/")
+
+		return true, redactedError{fmt.Errorf("request: %w", err), secret}
 	}
 
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
@@ -368,6 +444,22 @@ func sendOnce(client *http.Client, target string, body []byte, post bool) (bool,
 
 	return checkStatus(resp)
 }
+
+// redactedError hides secret from the message of the error it wraps.
+type redactedError struct {
+	err    error
+	secret string
+}
+
+func (e redactedError) Error() string {
+	if e.secret == "" {
+		return e.err.Error()
+	}
+
+	return strings.ReplaceAll(e.err.Error(), e.secret, "redacted")
+}
+
+func (e redactedError) Unwrap() error { return e.err }
 
 // checkStatus reports whether the response is an error, and whether that error is worth retrying.
 func checkStatus(resp *http.Response) (bool, error) {
