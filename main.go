@@ -121,7 +121,7 @@ func newLogger(w io.Writer, level slog.Level) *slog.Logger {
 // redact hides the pulse URL's secret part, keeping its first path segment to tell pulses apart.
 func redact(pulse string) string {
 	parsed, err := url.Parse(pulse)
-	if err != nil {
+	if err != nil || parsed.Opaque != "" { // String() prints Opaque, not Path, which would leak
 		return "redacted"
 	}
 
@@ -433,13 +433,10 @@ func sendOnce(client *http.Client, target string, body []byte, post bool) (bool,
 
 	resp, err := client.Do(req)
 	if err != nil {
-		// The error quotes the URL: hide its secret part, as it ends up in the logs.
-		urlErr, ok := errors.AsType[*url.Error](err)
-		if ok {
-			urlErr.URL = redact(urlErr.URL)
-		}
+		// The error quotes the URL, and redirect ones too: hide the secret part, as it ends up in the logs.
+		_, secret, _ := strings.Cut(strings.TrimPrefix(req.URL.EscapedPath(), "/"), "/")
 
-		return true, fmt.Errorf("request: %w", err)
+		return true, redactedError{fmt.Errorf("request: %w", err), secret}
 	}
 
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
@@ -447,6 +444,22 @@ func sendOnce(client *http.Client, target string, body []byte, post bool) (bool,
 
 	return checkStatus(resp)
 }
+
+// redactedError hides secret from the message of the error it wraps.
+type redactedError struct {
+	err    error
+	secret string
+}
+
+func (e redactedError) Error() string {
+	if e.secret == "" {
+		return e.err.Error()
+	}
+
+	return strings.ReplaceAll(e.err.Error(), e.secret, "redacted")
+}
+
+func (e redactedError) Unwrap() error { return e.err }
 
 // checkStatus reports whether the response is an error, and whether that error is worth retrying.
 func checkStatus(resp *http.Response) (bool, error) {

@@ -54,6 +54,7 @@ func TestRedact(t *testing.T) {
 	for input, want := range map[string]string{
 		"https://pulse.updown.io/abcd/EFGH1234":       "https://pulse.updown.io/abcd/redacted",
 		"http://user:pass@localhost:8080/x/y/z?k=v#f": "http://localhost:8080/x/redacted",
+		"https:abcd/EFGH1234":                         "redacted",
 	} {
 		got := redact(input)
 		if got != want || strings.Contains(got, "EFGH1234") {
@@ -231,12 +232,21 @@ func testRun(t *testing.T, cases []runCase) {
 func TestSendRedactsError(t *testing.T) {
 	t.Parallel()
 
-	srv, _, _ := server(t, http.StatusOK)
-	srv.Close() // connection refused: the error quotes the URL
+	refused, _, _ := server(t, http.StatusOK)
+	refused.Close() // connection refused: the error quotes the URL
 
-	err := send(slog.New(slog.DiscardHandler), srv.URL+"/x/SECRET", nil, 0, time.Second)
-	if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "/x/redacted") {
-		t.Errorf("send() error = %v, want it with the URL redacted", err)
+	// A malformed redirect: the error quotes the Location too.
+	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Location", "/x/SECRET%")
+		w.WriteHeader(http.StatusFound)
+	}))
+	t.Cleanup(redirect.Close)
+
+	for _, base := range []string{refused.URL, redirect.URL} {
+		err := send(slog.New(slog.DiscardHandler), base+"/x/SECRET", nil, 0, time.Second)
+		if err == nil || strings.Contains(err.Error(), "SECRET") || !strings.Contains(err.Error(), "/x/redacted") {
+			t.Errorf("send() error = %v, want it with the URL redacted", err)
+		}
 	}
 }
 
