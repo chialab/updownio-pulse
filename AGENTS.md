@@ -8,7 +8,7 @@ User-facing docs live in [README.md](README.md); contribution rules in [CONTRIBU
 - `main.go`: everything (flags, validation, command execution, HTTP pulse with retries).
 - `signals_unix.go`, `signals_windows.go`: the per-platform list of forwarded signals.
 - `main_test.go`: table-driven tests, all `t.Parallel()`.
-- `.goreleaser.yaml` + `Dockerfile`: release of binaries (linux/darwin/windows, amd64/arm64, linux/arm/v7) and the multi-arch `FROM scratch` image on GHCR.
+- `.goreleaser.yaml` + `Dockerfile`: release of binaries (linux/darwin/windows, amd64/arm64, linux/arm/v7), Linux packages (deb/rpm/apk, attached to the release only) and the multi-arch `FROM scratch` image on GHCR.
 - `.github/workflows/`: `ci.yml` (test matrix with `-race`, golangci-lint, govulncheck, zizmor) and `release.yml` (GoReleaser on `v*` tags).
 
 ## Commands

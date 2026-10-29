@@ -29,6 +29,24 @@ Copy it into your own image: Docker picks the right architecture automatically.
 COPY --from=ghcr.io/chialab/updownio-pulse:latest /usr/bin/updownio-pulse /usr/bin/updownio-pulse
 ```
 
+### Linux packages
+
+`.deb`, `.rpm` and `.apk` packages for `amd64`, `arm64` and `armv7` are attached to each release, and install the binary in `/usr/bin`.
+For example, on amd64:
+
+```sh
+# Debian, Ubuntu
+curl -fsSLO https://github.com/chialab/updownio-pulse/releases/latest/download/updownio-pulse_linux_amd64.deb
+sudo dpkg -i updownio-pulse_linux_amd64.deb
+
+# Fedora, RHEL
+sudo rpm -i https://github.com/chialab/updownio-pulse/releases/latest/download/updownio-pulse_linux_amd64.rpm
+
+# Alpine (packages aren't signed, see "Verifying artifacts" below)
+curl -fsSLO https://github.com/chialab/updownio-pulse/releases/latest/download/updownio-pulse_linux_amd64.apk
+apk add --allow-untrusted updownio-pulse_linux_amd64.apk
+```
+
 ### Pre-built binaries
 
 Download the archive for your platform from the [latest release](https://github.com/chialab/updownio-pulse/releases/latest).
@@ -43,7 +61,7 @@ Checksums are published alongside each release in `checksums.txt`.
 
 ### Verifying artifacts
 
-Archives and images come with [build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), proving they were built by this repository's release workflow:
+Archives, packages and images come with [build provenance attestations](https://docs.github.com/en/actions/security-for-github-actions/using-artifact-attestations), proving they were built by this repository's release workflow:
 
 ```sh
 gh attestation verify updownio-pulse_linux_amd64.tar.gz --repo chialab/updownio-pulse
