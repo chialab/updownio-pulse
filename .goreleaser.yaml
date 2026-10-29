@@ -47,6 +47,9 @@ nfpms:
 checksum:
   name_template: checksums.txt
 
+release:
+  prerelease: auto # keep -rc/-beta tags out of releases/latest
+
 dockers_v2:
   - images:
       - ghcr.io/chialab/updownio-pulse
