@@ -30,6 +30,20 @@ archives:
       - goos: windows
         formats: [zip]
 
+nfpms:
+  - # same stable naming as the archives; the extension is added per format
+    file_name_template: "{{ .ProjectName }}_{{ .Os }}_{{ .Arch }}{{ with .Arm }}v{{ . }}{{ end }}"
+    formats: [deb, rpm, apk]
+    bindir: /usr/bin # same path as in the Docker image
+    vendor: Chialab srl
+    maintainer: Chialab srl <dev@chialab.it>
+    homepage: https://github.com/chialab/updownio-pulse
+    description: Wraps a command and sends an updown.io pulse when it ends.
+    license: MIT
+    contents:
+      - src: LICENSE # MIT requires the notice to ship with every copy
+        dst: /usr/share/doc/updownio-pulse/LICENSE
+
 checksum:
   name_template: checksums.txt
 
